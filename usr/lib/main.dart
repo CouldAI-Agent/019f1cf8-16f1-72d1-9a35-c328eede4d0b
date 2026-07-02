@@ -1,7 +1,22 @@
 import 'package:flutter/material.dart';
 import 'dart:math';
 
-void main() {
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize Supabase with placeholders. 
+  // You will need to replace these with your actual Supabase URL and anon key.
+  try {
+    await Supabase.initialize(
+      url: 'https://your-project-id.supabase.co',
+      anonKey: 'your-anon-key',
+    );
+  } catch (e) {
+    debugPrint('Supabase init failed: $e');
+  }
+
   runApp(const LiveTextingApp());
 }
 
@@ -34,11 +49,23 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _codeController = TextEditingController();
+  final TextEditingController _createCodeController = TextEditingController();
 
   void _generateCode() {
     final random = Random();
     final code = List.generate(6, (_) => random.nextInt(10)).join();
-    _navigateToChat(code);
+    _createCodeController.text = code;
+  }
+
+  void _createCustomCode() {
+    final code = _createCodeController.text.trim();
+    if (code.isNotEmpty) {
+      _navigateToChat(code);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter a code to create a chat.')),
+      );
+    }
   }
 
   void _joinCode() {
@@ -79,10 +106,24 @@ class _HomeScreenState extends State<HomeScreen> {
               children: [
                 const Icon(Icons.chat_bubble_outline, size: 80, color: Colors.blueAccent),
                 const SizedBox(height: 32),
+                TextField(
+                  controller: _createCodeController,
+                  decoration: InputDecoration(
+                    labelText: 'Type your own code or generate one',
+                    border: const OutlineInputBorder(),
+                    prefixIcon: const Icon(Icons.edit),
+                    suffixIcon: IconButton(
+                      icon: const Icon(Icons.autorenew),
+                      onPressed: _generateCode,
+                      tooltip: 'Generate Random Code',
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
                 ElevatedButton.icon(
-                  onPressed: _generateCode,
+                  onPressed: _createCustomCode,
                   icon: const Icon(Icons.add),
-                  label: const Text('Create New Chat (Generate Code)'),
+                  label: const Text('Create & Enter Chat'),
                   style: ElevatedButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 16),
                   ),
@@ -144,37 +185,49 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+// Global Supabase client
+final supabase = Supabase.instance.client;
+
 class _ChatScreenState extends State<ChatScreen> {
-  final List<ChatMessage> _messages = [];
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  
+  // A unique ID to distinguish our own messages from others
+  final String _mySenderId = DateTime.now().millisecondsSinceEpoch.toString();
 
-  void _sendMessage() {
+  late final Stream<List<Map<String, dynamic>>> _messagesStream;
+
+  @override
+  void initState() {
+    super.initState();
+    // Setup Supabase real-time stream for this specific chat code
+    _messagesStream = supabase
+        .from('messages')
+        .stream(primaryKey: ['id'])
+        .eq('chat_code', widget.chatCode)
+        .order('created_at', ascending: true);
+  }
+
+  Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isNotEmpty) {
-      setState(() {
-        _messages.add(ChatMessage(
-          text: text,
-          isMe: true,
-          timestamp: DateTime.now(),
-        ));
-      });
       _messageController.clear();
       _scrollToBottom();
       
-      // Simulate reply
-      Future.delayed(const Duration(seconds: 1), () {
+      try {
+        await supabase.from('messages').insert({
+          'chat_code': widget.chatCode,
+          'content': text,
+          'sender_id': _mySenderId,
+        });
+      } catch (e) {
+        debugPrint('Error sending message. Check Supabase connection. $e');
         if (mounted) {
-          setState(() {
-            _messages.add(ChatMessage(
-              text: 'Mock reply to: $text',
-              isMe: false,
-              timestamp: DateTime.now(),
-            ));
-          });
-          _scrollToBottom();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to send message. Make sure Supabase keys are configured.')),
+          );
         }
-      });
+      }
     }
   }
 
@@ -219,28 +272,58 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: ListView.builder(
-              controller: _scrollController,
-              padding: const EdgeInsets.all(16),
-              itemCount: _messages.length,
-              itemBuilder: (context, index) {
-                final message = _messages[index];
-                return Align(
-                  alignment: message.isMe ? Alignment.centerRight : Alignment.centerLeft,
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: message.isMe ? Colors.blueAccent : Colors.grey[300],
-                      borderRadius: BorderRadius.circular(20),
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: _messagesStream,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting && !snapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                
+                if (snapshot.hasError) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Text('Error loading messages. Ensure Supabase is configured with keys.', textAlign: TextAlign.center),
                     ),
-                    child: Text(
-                      message.text,
-                      style: TextStyle(
-                        color: message.isMe ? Colors.white : Colors.black87,
+                  );
+                }
+
+                final messages = snapshot.data ?? [];
+                
+                if (messages.isEmpty) {
+                  return const Center(child: Text('No messages yet. Send one!'));
+                }
+
+                // Add a small delay for scrolling when new messages arrive
+                WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+
+                return ListView.builder(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.all(16),
+                  itemCount: messages.length,
+                  itemBuilder: (context, index) {
+                    final messageData = messages[index];
+                    final isMe = messageData['sender_id'] == _mySenderId;
+                    final text = messageData['content'] as String? ?? '';
+
+                    return Align(
+                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: isMe ? Colors.blueAccent : Colors.grey[300],
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          text,
+                          style: TextStyle(
+                            color: isMe ? Colors.white : Colors.black87,
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
+                    );
+                  },
                 );
               },
             ),
